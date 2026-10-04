@@ -1,7 +1,7 @@
 import * as prompts from "@clack/prompts";
 import { execa } from "execa";
 import { existsSync } from "node:fs";
-import { mkdir, readdir } from "node:fs/promises";
+import { mkdir, readdir, writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import pc from "picocolors";
 
@@ -12,9 +12,9 @@ import { applyCustomThemePack } from "../core/custom-theme.js";
 import { RadianceError, bindLogSession, ui } from "../core/logger.js";
 import { materializeLocales } from "../core/locales.js";
 import {
-  sweepI18nCatalogue,
-  syncLocaleKeysFromEnglish,
-} from "../core/i18n-sweep.js";
+  maybeSweepI18n,
+  maybeTranslateLocales,
+} from "../core/locale-pipeline.js";
 import { offerFollowUpPrompt } from "../harness/follow-up-offer.js";
 import { deriveVars, stageInstall } from "../core/install.js";
 import { upsertWorkspaceEnv } from "../core/env.js";
@@ -31,12 +31,10 @@ import {
   type PackageManager,
 } from "../core/package-manager.js";
 import { writeProjectConfig, type ProjectConfig } from "../core/project.js";
-import { translateLocaleFiles } from "../core/translate-locales.js";
+import { timed } from "../core/timings.js";
 import { runInitInterview } from "../harness/init-interview.js";
 import { planToOptionFlags } from "../harness/init-slots.js";
-import { createClient } from "../harness/llm.js";
 import { isThemeColors, type ThemePackData } from "../harness/theme-palette.js";
-import type { GlobalConfig, ProviderId } from "../core/config.js";
 import { setupFirebase, parsePlanFlag } from "./setup-firebase.js";
 
 export type InitOptions = {
@@ -58,6 +56,33 @@ export type InitOptions = {
   provider?: string;
   model?: string;
   demo?: boolean;
+  /**
+   * The name the app shows, when it should differ from its directory.
+   *
+   * The directory doubles as the display name, which is right at a terminal
+   * (`radiance init my-app`) and wrong for anything that picks the directory
+   * itself: the hosted platform builds in a temp dir named after an internal
+   * id, and every app it generated was titled `app_4e895bmul02ewa`.
+   */
+  displayName?: string;
+  /**
+   * Write the resolved plan here as JSON — which starter was chosen, what the
+   * description asked for beyond it — for callers that drive `init` without a
+   * terminal and need to act on the answer.
+   */
+  planJson?: string;
+  /**
+   * Machine-translate every locale other than English after install.
+   *
+   * Translation was reachable only through the AI interview, which decides it
+   * from the description; `--locale en,fr` on its own produced a `fr.json`
+   * that was a copy of `en.json`. Needs an LLM, like the interview.
+   */
+  translateLocales?: boolean;
+  /** `--no-i18n-sweep`: leave the hard-coded-copy sweep to a later `radiance translate`. */
+  i18nSweep?: boolean;
+  /** `--translation-memory <dir>`, for `--translate-locales`. */
+  translationMemory?: string;
 };
 
 type ResolvedInit = {
@@ -85,17 +110,29 @@ export async function initCommand(
   options: InitOptions,
 ): Promise<void> {
   const config = await loadConfig();
-  const source = await ensureTemplateSource(
-    config,
-    options.templateVersion ? { version: options.templateVersion } : {},
+  // Timed steps (`RADIANCE_TIMINGS_FILE`): `templates` can be a download on a
+  // cold cache, and `plan` holds the LLM call that reads `--prompt`.
+  const source = await timed("templates", () =>
+    ensureTemplateSource(
+      config,
+      options.templateVersion ? { version: options.templateVersion } : {},
+    ),
   );
 
-  const resolved = await resolveInitSettings(nameArg, options, source, config);
+  const resolved = await timed("plan", () =>
+    resolveInitSettings(nameArg, options, source, config),
+  );
 
   const root = isAbsolute(resolved.appName)
     ? resolved.appName
     : resolve(process.cwd(), resolved.appName);
-  const displayName = resolved.appName.split("/").pop() ?? resolved.appName;
+  const displayName =
+    options.displayName?.trim() ||
+    (resolved.appName.split("/").pop() ?? resolved.appName);
+
+  if (options.planJson) {
+    await writePlanJson(options.planJson, resolved);
+  }
 
   if (existsSync(root) && (await readdir(root)).length > 0) {
     throw new RadianceError(
@@ -160,20 +197,25 @@ export async function initCommand(
     ui.detail("extras    locale-picker (multi-locale)");
   }
 
-  const staged = await stageInstall({
-    root,
-    source,
-    vars,
-    scaffold: true,
-    starterId: resolved.starterId,
-    moduleIds: extraModules,
-    installed: [],
-    optionFlags: resolved.optionFlags,
-    interactiveOptions: false,
-    interactiveEnv: !options.yes,
-    // Secrets/params may be filled later — build/deploy enforce them.
-    interactiveServerConfig: false,
-  });
+  const staged = await timed("stage", () =>
+    stageInstall({
+      root,
+      source,
+      vars,
+      scaffold: true,
+      starterId: resolved.starterId,
+      moduleIds: extraModules,
+      installed: [],
+      optionFlags: resolved.optionFlags,
+      // This is `init`: an unqualified `--option key=value` (which is what
+      // `--theme-pack` becomes) may target any module the starter pulls in.
+      initMode: true,
+      interactiveOptions: false,
+      interactiveEnv: !options.yes,
+      // Secrets/params may be filled later — build/deploy enforce them.
+      interactiveServerConfig: false,
+    }),
+  );
 
   if (resolved.customTheme && resolved.themePack === "custom") {
     ui.trace("writing custom theme pack");
@@ -223,7 +265,9 @@ export async function initCommand(
 
   const changes = staged.workspace.changes();
   ui.trace(`writing ${changes.length} file change(s) to disk`);
-  await applyChanges(root, changes, { confirm: false, dryRun: false });
+  await timed("write", () =>
+    applyChanges(root, changes, { confirm: false, dryRun: false }),
+  );
   reportNotes(staged.workspace.getNotes());
   await writeProjectConfig(root, projectConfig);
 
@@ -232,14 +276,16 @@ export async function initCommand(
 
   if (options.git !== false) {
     ui.trace("initialising git repository");
-    await initGit(root);
+    await timed("git", () => initGit(root));
   } else {
     ui.trace("skipping git init (--no-git)");
   }
 
   if (options.install !== false) {
     ui.trace(`installing dependencies with ${resolved.packageManager}`);
-    await installDependencies(root, resolved.packageManager);
+    await timed("install", () =>
+      installDependencies(root, resolved.packageManager),
+    );
   } else {
     ui.trace("skipping dependency install (--no-install)");
   }
@@ -258,12 +304,20 @@ export async function initCommand(
   );
 
   if (resolved.followUpPrompt) {
-    await maybeRunFollowUp(root, resolved.followUpPrompt, options.yes === true);
+    const followUp = resolved.followUpPrompt;
+    await timed("follow-up", () =>
+      maybeRunFollowUp(root, followUp, options.yes === true),
+    );
   }
 
   // Sweep hardcoded UI copy into locales/en.json before translating other locales.
+  // `--no-i18n-sweep` defers it to whoever runs `radiance translate` later —
+  // a caller that writes more code after `init` would otherwise pay for the
+  // sweep twice, and the first pass would miss the strings written after it.
   const needsI18nSweep =
-    resolved.translateLocales === true || locales.some((code) => code !== "en");
+    options.i18nSweep !== false &&
+    (resolved.translateLocales === true ||
+      locales.some((code) => code !== "en"));
   if (needsI18nSweep) {
     await maybeSweepI18n(root, locales, config, options);
   }
@@ -331,7 +385,8 @@ async function resolveInitSettings(
       themePack: plan.themePack!,
       locale: plan.locale!,
       locales,
-      translateLocales: plan.translateLocales,
+      translateLocales:
+        options.translateLocales === true || plan.translateLocales,
       ...(customTheme ? { customTheme } : {}),
       bundleId: plan.bundleId,
       followUpPrompt: plan.followUpPrompt,
@@ -363,13 +418,27 @@ async function resolveInitSettings(
         : []),
   ];
 
-  const locale = options.locale ?? starter?.defaults?.defaultLocale ?? "en";
-  const locales = normalizeLocales(
-    options.locale?.includes(",")
-      ? options.locale.split(",").map((part) => part.trim())
-      : undefined,
-    locale,
-  );
+  /*
+   * `--locale en,fr` means "default en, plus fr" — not a locale called "en,fr".
+   *
+   * The whole flag value was being used as the default locale, so a
+   * comma-separated list produced `defaultLocale: "en,fr"`, a `locales` array
+   * containing the literal `"en,fr"`, and a `locales/en,fr.json` file next to
+   * the real ones. The default is the first entry.
+   */
+  const localeFlag = options.locale?.trim();
+  const requestedLocales = localeFlag?.includes(",")
+    ? localeFlag
+        .split(",")
+        .map((part) => part.trim())
+        .filter(Boolean)
+    : undefined;
+  const locale =
+    requestedLocales?.[0] ??
+    localeFlag ??
+    starter?.defaults?.defaultLocale ??
+    "en";
+  const locales = normalizeLocales(requestedLocales, locale);
 
   return {
     appName,
@@ -379,6 +448,7 @@ async function resolveInitSettings(
     themePack: options.themePack ?? starter?.defaults?.themePack ?? "neutral",
     locale: locales[0] ?? locale,
     locales,
+    translateLocales: options.translateLocales === true,
     bundleId: options.bundleId,
   };
 }
@@ -461,91 +531,6 @@ async function promptPackageManager(
 
   if (prompts.isCancel(choice)) throw new RadianceError("Cancelled.");
   return choice as PackageManager;
-}
-
-function llmOverrides(options: Pick<InitOptions, "provider" | "model">): {
-  provider?: ProviderId;
-  model?: string;
-} {
-  const overrides: { provider?: ProviderId; model?: string } = {};
-  if (options.provider) overrides.provider = options.provider as ProviderId;
-  if (options.model) overrides.model = options.model;
-  return overrides;
-}
-
-async function maybeSweepI18n(
-  root: string,
-  locales: string[],
-  config: GlobalConfig,
-  options: Pick<InitOptions, "provider" | "model" | "yes">,
-): Promise<void> {
-  const { Workspace } = await import("../core/apply/workspace.js");
-  const { applyChanges } = await import("../core/apply/writer.js");
-
-  try {
-    const client = createClient(config, llmOverrides(options));
-    ui.blank();
-    ui.heading("Ensuring all UI strings are in locales");
-
-    const workspace = new Workspace(root);
-    const result = await sweepI18nCatalogue(workspace, client, root);
-    await syncLocaleKeysFromEnglish(workspace, locales);
-
-    const changes = workspace.changes();
-    if (changes.length > 0) {
-      await applyChanges(root, changes, { confirm: false, dryRun: false });
-    }
-    ui.success(
-      `i18n sweep complete (+${result.keysAdded} keys, ${result.filesEdited} file(s) updated)`,
-    );
-  } catch (error) {
-    ui.warn(
-      error instanceof Error
-        ? `i18n sweep skipped: ${error.message}`
-        : "i18n sweep skipped.",
-    );
-    if (error instanceof RadianceError && error.hint) ui.detail(error.hint);
-  }
-}
-
-async function maybeTranslateLocales(
-  root: string,
-  locales: string[],
-  config: GlobalConfig,
-  options: Pick<InitOptions, "provider" | "model" | "yes">,
-): Promise<void> {
-  const targets = locales.filter((code) => code !== "en");
-  if (targets.length === 0) return;
-
-  // Build a disk-backed workspace so we read files the follow-up prompt / i18n sweep wrote.
-  const { Workspace } = await import("../core/apply/workspace.js");
-  const { applyChanges } = await import("../core/apply/writer.js");
-
-  try {
-    const client = createClient(config, llmOverrides(options));
-
-    ui.blank();
-    ui.heading("Translating locale files");
-
-    const workspace = new Workspace(root);
-    await translateLocaleFiles(workspace, locales, client);
-
-    const changes = workspace.changes();
-    if (changes.length > 0) {
-      await applyChanges(root, changes, { confirm: false, dryRun: false });
-      ui.success(`Translated ${changes.length} locale file(s)`);
-    }
-  } catch (error) {
-    ui.warn(
-      error instanceof Error
-        ? `Locale translation skipped: ${error.message}`
-        : "Locale translation skipped.",
-    );
-    if (error instanceof RadianceError && error.hint) ui.detail(error.hint);
-    ui.detail(
-      `Translate later with: radiance prompt "Translate locales/${targets.join(", locales/")} from English"`,
-    );
-  }
 }
 
 async function maybeSetupFirebase(
@@ -777,4 +762,31 @@ async function installDependencies(
         : `Run \`${hint}\` yourself.`,
     );
   }
+}
+
+/**
+ * The resolved plan, for a caller without a terminal.
+ *
+ * Written before anything is staged, so a caller can tell "the description
+ * resolved to this" apart from "the install then failed". `followUpPrompt` is
+ * the part of the description the chosen starter does not already cover;
+ * under `-y` it is otherwise only printed.
+ */
+async function writePlanJson(
+  path: string,
+  resolved: ResolvedInit,
+): Promise<void> {
+  const out = {
+    starterId: resolved.starterId,
+    themePack: resolved.themePack,
+    locale: resolved.locale,
+    locales: resolved.locales,
+    translateLocales: resolved.translateLocales ?? false,
+    extraModules: resolved.extraModules ?? [],
+    followUpPrompt: resolved.followUpPrompt ?? null,
+    promptGaps: resolved.promptGaps ?? [],
+    suggestedPlan: resolved.suggestedPlan ?? null,
+    openingPrompt: resolved.openingPrompt ?? null,
+  };
+  await writeFile(path, `${JSON.stringify(out, null, 2)}\n`, "utf8");
 }

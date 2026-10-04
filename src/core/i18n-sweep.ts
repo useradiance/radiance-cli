@@ -1,3 +1,4 @@
+import { execa } from "execa";
 import fg from "fast-glob";
 import { z } from "zod";
 
@@ -35,14 +36,63 @@ const IGNORED = [
 const HARDCODED_HINT =
   />\s*[A-Z][^<{]{2,}|["'`][A-Z][^"'`]{3,}["'`]\s*(?:\}|,|\))|title:\s*['"][A-Z]|placeholder=\{?['"][A-Z]/;
 
+/** The UI files the sweep considers: screens and components, minus build output. */
+function listUiFiles(root: string): Promise<string[]> {
+  return fg(UI_GLOBS, { cwd: root, onlyFiles: true, ignore: IGNORED });
+}
+
+/**
+ * UI files changed since `ref`: committed since it, staged, unstaged, or new
+ * and untracked. `null` when git cannot say (no repository, unknown ref), so
+ * the caller can fall back to sweeping everything.
+ *
+ * For `radiance translate --since`: after a follow-up prompt only the files
+ * that prompt wrote can have new hard-coded copy, and sending the model two
+ * dozen untouched screens again costs a long call for nothing. Deleted files
+ * drop out because only files that exist and match the sweep's globs are
+ * returned. `--relative` and `-z` keep paths relative to the project (it may
+ * sit inside a larger repository) and immune to git's path quoting.
+ */
+export async function changedUiFiles(
+  root: string,
+  ref: string,
+): Promise<string[] | null> {
+  // A "ref" starting with "-" would reach git as an option (`--output=…`).
+  if (!ref.trim() || ref.startsWith("-")) return null;
+
+  const listings = await Promise.all(
+    [
+      ["diff", "--name-only", "--relative", "-z", ref, "HEAD"],
+      ["diff", "--name-only", "--relative", "-z"],
+      ["diff", "--name-only", "--relative", "-z", "--cached"],
+      ["ls-files", "--others", "--exclude-standard", "-z"],
+    ].map((args) => execa("git", args, { cwd: root, reject: false })),
+  );
+  if (listings.some((listing) => listing.exitCode !== 0)) return null;
+
+  const changed = new Set(
+    listings.flatMap((listing) =>
+      String(listing.stdout ?? "")
+        .split("\0")
+        .filter(Boolean),
+    ),
+  );
+  const candidates = await listUiFiles(root);
+  return candidates.filter((path) => changed.has(path)).sort();
+}
+
 /**
  * Ask the LLM to put every user-facing string into locales/en.json and wire components
  * through `t()`. Runs after feature generation and before translating other locales.
+ *
+ * `onlyPaths` narrows the review to those UI files (see `changedUiFiles`);
+ * without it every UI file is a candidate, as before.
  */
 export async function sweepI18nCatalogue(
   workspace: Workspace,
   client: LlmClient,
   root: string,
+  onlyPaths?: string[],
 ): Promise<{ keysAdded: number; filesEdited: number }> {
   const enRaw = await workspace.read(EN_PATH);
   if (!enRaw) {
@@ -59,11 +109,10 @@ export async function sweepI18nCatalogue(
     throw new RadianceError("locales/en.json is not valid JSON");
   }
 
-  const candidates = await fg(UI_GLOBS, {
-    cwd: root,
-    onlyFiles: true,
-    ignore: IGNORED,
-  });
+  const scope = onlyPaths ? new Set(onlyPaths) : null;
+  const candidates = (await listUiFiles(root)).filter(
+    (path) => !scope || scope.has(path),
+  );
 
   const suspicious: string[] = [];
   for (const path of candidates.sort()) {
@@ -85,6 +134,13 @@ export async function sweepI18nCatalogue(
   ]
     .sort()
     .slice(0, 24);
+
+  // A scoped sweep whose changed files hold nothing worth reviewing (a short
+  // style wrapper, say) has nothing to ask the model about.
+  if (scope && focus.length === 0) {
+    ui.detail("None of the changed UI files need an i18n review.");
+    return { keysAdded: 0, filesEdited: 0 };
+  }
 
   const snippets = await readSnippets(root, focus);
   // Prefer workspace overlay contents when present (post-follow-up edits may be staged).

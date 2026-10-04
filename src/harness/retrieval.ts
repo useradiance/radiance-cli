@@ -310,13 +310,9 @@ export function contractSourceFiles(files: string[]): string[] {
    * Derived from the project now, in priority order, so a component added to
    * the catalogue is covered without anyone remembering to add it here.
    */
-  const ui = files.filter((path) =>
-    /^components\/ui\/[^/]+\.tsx?$/.test(path),
-  );
+  const ui = files.filter((path) => /^components\/ui\/[^/]+\.tsx?$/.test(path));
   const hooks = files.filter((path) => /^hooks\/[^/]+\.tsx?$/.test(path));
-  const shared = files.filter((path) =>
-    /^components\/[^/]+\.tsx?$/.test(path),
-  );
+  const shared = files.filter((path) => /^components\/[^/]+\.tsx?$/.test(path));
   const themeAndRegistry = files.filter((path) =>
     /^lib\/(theme|registry)\/[^/]+\.tsx?$/.test(path),
   );

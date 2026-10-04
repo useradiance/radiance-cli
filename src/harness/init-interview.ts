@@ -132,11 +132,17 @@ export async function loadOptionCatalog(
   source: TemplateSource,
 ): Promise<OptionCatalog> {
   const catalog: OptionCatalog = {};
-  const moduleIds = ["navigation", "auth", "firestore", "theme"] as const;
-
-  for (const moduleId of moduleIds) {
-    if (!source.registry.modules.some((module) => module.id === moduleId))
-      continue;
+  /*
+   * Every module, not a hand-picked four.
+   *
+   * This listed navigation, auth, firestore and theme, and the catalogue is
+   * what `sanitizePlanOptions` validates against — so on the `--prompt` path
+   * any `--option` for another module was silently discarded.
+   * `--option search.backend=algolia` on a description that lands on Social
+   * (which includes Search) produced Firestore search, with no warning. Only
+   * five modules declare options today, so this costs a handful of small reads.
+   */
+  for (const { id: moduleId } of source.registry.modules) {
     const manifest = await readModuleManifest(source, moduleId);
     for (const [key, def] of Object.entries(manifest.options)) {
       catalog[`${moduleId}.${key}`] = def;
@@ -173,6 +179,42 @@ function planSummaryForPrompt(plan: InitPlan): string {
     );
   }
   return lines.join("\n");
+}
+
+/**
+ * The starter a description falls back to when none fits closely.
+ *
+ * A description must never end in the bare scaffold: it has no screens, so the
+ * app's first preview is a placeholder ("This is your app shell…") and every
+ * feature the user asked for is built from nothing. Productivity — projects,
+ * items, detail screens, comments, collaborators, per-user data — is the most
+ * general shape in the catalogue and adapts to most domains.
+ */
+export const GENERIC_STARTER = "productivity";
+
+/**
+ * Give a description-driven plan a starter when it has none.
+ *
+ * The keyword ranking first (a weak match beats no match), then
+ * {@link GENERIC_STARTER}. Leaves an explicit choice alone, including the
+ * bare scaffold when the caller pinned it (`--scaffold`).
+ */
+export function ensurePromptStarter(
+  plan: InitPlan,
+  registry: Registry,
+  prompt: string,
+): InitPlan {
+  if (plan.starterId) return plan;
+  const ranked = matchStarters(registry, prompt).find(
+    (match) => match.id !== null,
+  );
+  const generic = registry.starters.some(
+    (starter) => starter.id === GENERIC_STARTER,
+  )
+    ? GENERIC_STARTER
+    : registry.starters[0]?.id;
+  const starterId = ranked?.id ?? generic;
+  return starterId ? { ...plan, starterId } : plan;
 }
 
 /** Deterministic extraction when the LLM is unavailable. */
@@ -836,6 +878,19 @@ export async function runInitInterview(args: {
     if (extracted.updates.rationale) {
       ui.step(extracted.updates.rationale);
     }
+    // A description never ends in the bare scaffold unless the caller pinned
+    // it: "no close match" means the closest starter, not no starter. Without
+    // `-y` an undecided starter is still asked for; with it, it is filled here
+    // rather than defaulting to null below.
+    const pinnedScaffold = locked.has("starterId") && plan.starterId === null;
+    if (
+      !pinnedScaffold &&
+      (plan.starterId === null || (flags.yes && plan.starterId === undefined))
+    ) {
+      plan = ensurePromptStarter(plan, registry, opening);
+      ui.step(`Closest starter: ${plan.starterId}.`);
+    }
+
     // Starter may already be known — compute prompt↔template delta immediately.
     if (plan.starterId !== undefined) {
       plan = applyPromptDelta(

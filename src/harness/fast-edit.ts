@@ -231,7 +231,9 @@ export async function fastEdit(
     if (!allowed.has(file.path)) {
       // validatePlan rejected it (protected path, traversal). Say so rather
       // than dropping it silently — the user asked for something they did not get.
-      notes.push(`${file.path}: refused — this file is not editable by a prompt.`);
+      notes.push(
+        `${file.path}: refused — this file is not editable by a prompt.`,
+      );
       continue;
     }
     files.push({ path: file.path, contents: file.contents, notes: file.notes });

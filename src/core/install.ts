@@ -45,6 +45,18 @@ export type StageOptions = {
   existingFeatures?: InstalledFeature[];
   /** Raw `--option key=value` flags from the CLI. */
   optionFlags?: string[];
+  /**
+   * True for `radiance init`, where an unqualified `--option key=value` may
+   * target any module the starter brings in.
+   *
+   * Was inferred as `moduleIds.length === 0`, which is not the same question
+   * and got it wrong: `init --demo` pushes `demo-data` into `moduleIds`, so a
+   * plain `--theme-pack ocean` was silently discarded and every project built
+   * with demo content came out in the theme module's default palette instead
+   * of the one that was asked for. The caller knows which command it is; it
+   * should say so rather than have it guessed from an unrelated field.
+   */
+  initMode?: boolean;
   /** Prompt for options that were not supplied. */
   interactiveOptions?: boolean;
   /** Prompt for module env vars marked prompt/required (defaults to interactiveOptions). */
@@ -138,7 +150,7 @@ export async function stageInstall(
     const manifest = await readModuleManifest(options.source, id);
     const previous = previousById.get(id)?.options;
     const explicitlyRequested = options.moduleIds.includes(id);
-    const initMode = options.moduleIds.length === 0;
+    const initMode = options.initMode ?? options.moduleIds.length === 0;
     const moduleOptions = await resolveModuleOptions(
       manifest,
       flagsForModule(flags, id, manifest, explicitlyRequested, initMode),
@@ -195,10 +207,13 @@ export async function stageInstall(
 }
 
 /**
- * Flags without a module prefix apply to an explicitly requested module that declares
- * the option, or — during `init`, when nothing was named — to whichever module owns it.
+ * Flags without a module prefix apply to an explicitly requested module that
+ * declares the option, or — during `init` — to whichever module owns it.
+ *
+ * "During `init`" is now told to us rather than guessed from an empty module
+ * list; see `StageOptions.initMode`.
  */
-function flagsForModule(
+export function flagsForModule(
   flags: OptionFlag[],
   moduleId: string,
   manifest: ModuleManifest,

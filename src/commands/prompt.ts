@@ -21,6 +21,7 @@ import {
   runScriptInDirCommand,
 } from "../core/package-manager.js";
 import { RUNS_DIR } from "../core/paths.js";
+import { recordCount, timed } from "../core/timings.js";
 import {
   requireProject,
   writeProjectConfig,
@@ -61,21 +62,47 @@ export type PromptOptions = {
   skipFollowUp?: boolean;
   /** With `-y`, auto-run the residual follow-up once. */
   followUp?: boolean;
+  /**
+   * Repair rounds after a failing typecheck, instead of the configured
+   * `maxFixIterations`. A string from commander; validated in `repairRounds`.
+   *
+   * For callers that want a working result quickly more than a clean one: each
+   * round is a model call over the failing files — tens of seconds — and a
+   * type error does not stop the app from bundling or running.
+   */
+  maxRepairs?: string | number;
 };
 
+/*
+ * Steps are timed for `RADIANCE_TIMINGS_FILE` under `prompt`, so a chained
+ * follow-up — which is this function again — nests as
+ * `prompt/follow-up/prompt/...` and its time is told apart from the first
+ * half's.
+ */
 export async function promptCommand(
   request: string,
   options: PromptOptions,
 ): Promise<void> {
+  await timed("prompt", () => promptCommandBody(request, options));
+}
+
+async function promptCommandBody(
+  request: string,
+  options: PromptOptions,
+): Promise<void> {
+  // Refused before any model call, not after the code is already written.
+  repairRounds(options.maxRepairs, 0);
   const { root, config: project } = await requireProject();
   bindLogSession(root);
   const config = await loadConfig();
-  const source = await ensureTemplateSource(config);
+  const source = await timed("templates", () => ensureTemplateSource(config));
 
   const client = withHarnessLogging(
     createClient(config, harnessOverrides(project, config, options)),
   );
-  const context = await buildContext(root, project, source);
+  const context = await timed("context", () =>
+    buildContext(root, project, source),
+  );
 
   ui.heading(
     `radiance prompt ${pc.dim(`(${client.provider} ${client.model})`)}`,
@@ -133,14 +160,18 @@ async function runPrompt(
     spinner.start("Planning and writing");
     let result;
     try {
-      result = await fastEdit(client, context, request);
+      result = await timed("fast-edit", () =>
+        fastEdit(client, context, request),
+      );
     } catch (error) {
       spinner.stop(
         error instanceof Error ? `Failed: ${error.message}` : "Failed",
       );
       throw error;
     }
-    const created = result.plan.files.filter((f) => f.action === "create").length;
+    const created = result.plan.files.filter(
+      (f) => f.action === "create",
+    ).length;
     const modified = result.plan.files.length - created;
     const parts: string[] = [];
     if (created > 0) parts.push(`${created} created`);
@@ -160,7 +191,7 @@ async function runPrompt(
 
     let planned;
     try {
-      planned = await createPlan(client, context, request);
+      planned = await timed("plan", () => createPlan(client, context, request));
     } catch (error) {
       spinner.stop(
         error instanceof Error
@@ -198,21 +229,23 @@ async function runPrompt(
   // Modules are staged into the same workspace the edits use, so generated code can read the
   // files a module just installed and the user sees one combined diff.
   if (plan.modules.length > 0) {
-    const staged = await stageInstall({
-      root,
-      source,
-      vars: deriveVars(project.name, {
-        themePack: project.themePack,
-        defaultLocale: project.defaultLocale,
-        bundleId: project.bundleId,
-        scheme: project.scheme,
+    const staged = await timed("stage-modules", () =>
+      stageInstall({
+        root,
+        source,
+        vars: deriveVars(project.name, {
+          themePack: project.themePack,
+          defaultLocale: project.defaultLocale,
+          bundleId: project.bundleId,
+          scheme: project.scheme,
+        }),
+        scaffold: false,
+        starterId: null,
+        moduleIds: plan.modules,
+        installed: project.features.map((feature) => feature.id),
+        existingFeatures: project.features,
       }),
-      scaffold: false,
-      starterId: null,
-      moduleIds: plan.modules,
-      installed: project.features.map((feature) => feature.id),
-      existingFeatures: project.features,
-    });
+    );
 
     workspace = staged.workspace;
     updatedProject = { ...project, features: staged.features };
@@ -242,13 +275,8 @@ async function runPrompt(
     );
 
     try {
-      const results = await batchEditFiles(
-        client,
-        context,
-        workspace,
-        request,
-        plan,
-        references,
+      const results = await timed("write", () =>
+        batchEditFiles(client, context, workspace, request, plan, references),
       );
       for (const result of results) {
         if (result.notes) editNotes.push(`${result.path}: ${result.notes}`);
@@ -272,10 +300,12 @@ async function runPrompt(
   }
 
   const changes = workspace.changes();
-  const result = await applyChanges(root, changes, {
-    confirm: !options.yes,
-    dryRun: options.dryRun ?? false,
-  });
+  const result = await timed("apply", () =>
+    applyChanges(root, changes, {
+      confirm: !options.yes,
+      dryRun: options.dryRun ?? false,
+    }),
+  );
 
   reportNotes(workspace.getNotes());
 
@@ -302,13 +332,8 @@ async function runPrompt(
   }
 
   ui.heading("Verify");
-  const verified = await verifyAndRepair(
-    client,
-    context,
-    root,
-    config,
-    options,
-    references,
+  const verified = await timed("verify", () =>
+    verifyAndRepair(client, context, root, config, options, references),
   );
   const { written: verifyWritten, ...verification } = verified;
   await saveRun(
@@ -324,37 +349,39 @@ async function runPrompt(
       ...result.written.map((change) => change.path),
       ...verifyWritten,
     ];
-    await maybeRedeployCloudArtifacts(root, writtenPaths, {
-      plan: updatedProject.plan ?? project.plan ?? "free",
-      buildFunctions: async () => {
-        const pm = await resolvePackageManager({
-          root,
-          project: updatedProject.packageManager ?? project.packageManager,
-          global: config.packageManager,
-        });
-        ui.step("Building Cloud Functions");
-        const { command, args } = runScriptInDirCommand(
-          pm,
-          "functions",
-          "build",
-        );
-        const build = await execa(command, args, {
-          cwd: root,
-          stdio: "inherit",
-          reject: false,
-        });
-        if (build.exitCode !== 0) {
-          throw new RadianceError(
-            "The functions build failed",
-            "See the output above.",
+    await timed("redeploy", () =>
+      maybeRedeployCloudArtifacts(root, writtenPaths, {
+        plan: updatedProject.plan ?? project.plan ?? "free",
+        buildFunctions: async () => {
+          const pm = await resolvePackageManager({
+            root,
+            project: updatedProject.packageManager ?? project.packageManager,
+            global: config.packageManager,
+          });
+          ui.step("Building Cloud Functions");
+          const { command, args } = runScriptInDirCommand(
+            pm,
+            "functions",
+            "build",
           );
-        }
-      },
-    });
+          const build = await execa(command, args, {
+            cwd: root,
+            stdio: "inherit",
+            reject: false,
+          });
+          if (build.exitCode !== 0) {
+            throw new RadianceError(
+              "The functions build failed",
+              "See the output above.",
+            );
+          }
+        },
+      }),
+    );
   }
 
   if (config.gitAutoCommit) {
-    await commit(root, request);
+    await timed("commit", () => commit(root, request));
   }
 
   await maybeOfferPlanFollowUp(plan, options);
@@ -376,9 +403,72 @@ async function maybeOfferPlanFollowUp(
     confirmMessage:
       "Apply the remaining work now with another `radiance prompt`?",
     run: async (next) => {
-      await promptCommand(next, { yes: true, skipFollowUp: true });
+      // Carry the run's own choices into the follow-up. It used to start with
+      // only `{ yes, skipFollowUp }`, so `--provider cursor` fell back to the
+      // configured default (anthropic) for the second half of the same
+      // request — which, on a machine with only a Cursor key, failed with
+      // "needs it to reach anthropic" after the first half had succeeded.
+      recordCount("prompt.followUpChained", 1);
+      await timed("follow-up", () =>
+        promptCommand(next, {
+          yes: true,
+          skipFollowUp: true,
+          ...followUpRunOptions(options),
+        }),
+      );
     },
   });
+}
+
+/**
+ * `--max-repairs`, or the configured rounds. Exported for tests.
+ *
+ * Bounded like `maxFixIterations` itself (0–5): a typo must not turn into an
+ * unbounded repair loop, and a value that is not a number is refused rather
+ * than silently read as zero.
+ */
+export function repairRounds(
+  flag: string | number | undefined,
+  configured: number,
+): number {
+  if (flag === undefined) return configured;
+  // `Number("")` is 0, so a blank value has to be refused by name.
+  const value =
+    typeof flag === "number"
+      ? flag
+      : flag.trim() === ""
+        ? Number.NaN
+        : Number(flag.trim());
+  if (!Number.isInteger(value) || value < 0 || value > 5) {
+    throw new RadianceError(
+      `--max-repairs must be a whole number from 0 to 5 (got ${JSON.stringify(flag)})`,
+    );
+  }
+  return value;
+}
+
+/**
+ * The options a chained follow-up inherits from the run that produced it.
+ *
+ * Exported for tests. `dryRun`/`planOnly` never reach here (no follow-up is
+ * offered for them), and `followUp` is deliberately dropped: a follow-up does
+ * not chain another one.
+ */
+export function followUpRunOptions(
+  options: PromptOptions,
+): Pick<
+  PromptOptions,
+  "provider" | "model" | "effort" | "verify" | "maxRepairs"
+> {
+  return {
+    ...(options.provider ? { provider: options.provider } : {}),
+    ...(options.model ? { model: options.model } : {}),
+    ...(options.effort ? { effort: options.effort } : {}),
+    ...(options.verify === undefined ? {} : { verify: options.verify }),
+    ...(options.maxRepairs === undefined
+      ? {}
+      : { maxRepairs: options.maxRepairs }),
+  };
 }
 
 /** Persist a failure record when plan/edit did not already dump one (e.g. API errors). */
@@ -442,12 +532,15 @@ async function verifyAndRepair(
       written: [],
     };
 
-  const maxRounds = config.maxFixIterations;
+  const maxRounds = repairRounds(options.maxRepairs, config.maxFixIterations);
   const projectContracts = await buildProjectContracts(
     context.root,
     context.files,
   );
   const written: string[] = [];
+  // Summed once per repair round. Recorded as 0 up front so a run whose first
+  // typecheck passes still reports the counter.
+  recordCount("verify.rounds", 0);
 
   for (let attempt = 0; attempt <= maxRounds; attempt += 1) {
     const spinner = prompts.spinner();
@@ -506,20 +599,23 @@ async function verifyAndRepair(
 
     const repairWorkspace = new Workspace(root);
 
-    const repairResults = await Promise.all(
-      targets.map(async (path) => {
-        const snippets = await referenceSnippets(context, references, [path]);
-        const errors = errorsFor(check.output, path);
-        const ok = await repairFile(
-          client,
-          repairWorkspace,
-          path,
-          errors,
-          snippets,
-          projectContracts,
-        );
-        return { path, ok };
-      }),
+    recordCount("verify.rounds", 1);
+    const repairResults = await timed("repair", () =>
+      Promise.all(
+        targets.map(async (path) => {
+          const snippets = await referenceSnippets(context, references, [path]);
+          const errors = errorsFor(check.output, path);
+          const ok = await repairFile(
+            client,
+            repairWorkspace,
+            path,
+            errors,
+            snippets,
+            projectContracts,
+          );
+          return { path, ok };
+        }),
+      ),
     );
 
     let repaired = 0;

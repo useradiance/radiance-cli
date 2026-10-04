@@ -1,6 +1,6 @@
 {
   "name": "radiance-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Build Expo + Firebase apps from the Radiance template catalogue, with a template-first AI prompt harness.",
   "license": "MIT",
   "type": "module",

@@ -9,6 +9,10 @@ import { loadConfig } from "../core/config.js";
 import { upsertWorkspaceEnv } from "../core/env.js";
 import { maybeRedeployCloudArtifacts } from "../core/firebase-provision.js";
 import { deriveVars, stageInstall } from "../core/install.js";
+import {
+  maybeSweepI18n,
+  maybeTranslateLocales,
+} from "../core/locale-pipeline.js";
 import { RadianceError, bindLogSession, ui } from "../core/logger.js";
 import {
   formatInstallHint,
@@ -30,9 +34,50 @@ export type AddOptions = {
   pack?: string;
   option?: string[];
   force?: boolean;
+  /**
+   * Sweep and translate the project's locales once the modules are in.
+   *
+   * A module brings its own English strings, so in a multi-locale project
+   * every other catalogue is missing them until they are translated — the
+   * French app would show the new screens in English.
+   */
+  translateLocales?: boolean;
+  /** Model for the sweep and translation; mirrors `radiance prompt`. */
+  provider?: string;
+  model?: string;
+  /** `--translation-memory <dir>`, for the translation above. */
+  translationMemory?: string;
 };
 
 export async function addCommand(
+  moduleIds: string[],
+  options: AddOptions,
+): Promise<void> {
+  await installModules(moduleIds, options);
+
+  /*
+   * Translation runs whatever the install did — including nothing.
+   *
+   * `installModules` returns early when every requested module is already
+   * present, which is common when a caller cannot know the starter's module
+   * list in advance (the hosted platform lets the CLI pick the starter). Tying
+   * translation to "something was installed" left those projects' catalogues
+   * in English without a word.
+   */
+  if (options.translateLocales && !options.dryRun) {
+    const { root, config: project } = await requireProject();
+    const locales = project.locales ?? [];
+    if (locales.some((code) => code !== "en")) {
+      const config = await loadConfig();
+      // Sweep first so strings a module hard-codes are in `en.json` before the
+      // other catalogues are translated from it.
+      await maybeSweepI18n(root, locales, config, options);
+      await maybeTranslateLocales(root, locales, config, options);
+    }
+  }
+}
+
+async function installModules(
   moduleIds: string[],
   options: AddOptions,
 ): Promise<void> {
@@ -157,6 +202,7 @@ export async function addCommand(
 
   ui.blank();
   ui.success(`Installed ${added.join(", ")}`);
+
   if (enableDemo) {
     ui.detail(
       "EXPO_PUBLIC_SEED_DEMO=true (demo seed on first signed-in launch)",

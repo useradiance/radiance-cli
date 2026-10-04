@@ -379,8 +379,11 @@ export function buildInitExtractPrompt(args: {
 
 Rules:
 1. Only fill fields that the utterance clearly evidences. Do not invent required values.
-2. Prefer a catalogue starter over bare scaffold when the request matches a starter's capabilities.
-3. Use starterId null only for bare / from-scratch / tooling-only requests.
+2. A description of an app always gets a catalogue starter: the closest one, even when it fits
+   only partly — followUpPrompt adapts it. When nothing is close, use "productivity" (general
+   lists, detail screens, per-user data).
+3. Use starterId null only when the utterance explicitly asks for an empty project with no
+   screens. "From scratch" or an unusual domain is not that — pick the closest starter.
 4. themePack must be one of: neutral, contrast, branded, ocean, ink, hearth, bloom, flare, paper, grove, violet, citrus (never invent custom here).
 5. packageManager must be one of: npm, yarn, pnpm, bun.
 6. options keys must be exactly from the allowed list below (e.g. "navigation.shell", "auth.providers").
@@ -410,7 +413,7 @@ ${args.missing.join(", ") || "(none)"}
 # Starters
 
 ${starterLines}
-- bare scaffold: tooling only, no domain screens
+- bare scaffold: no screens at all — only when explicitly asked for an empty project
 
 # Starter ranking for this utterance
 

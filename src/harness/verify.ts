@@ -2,6 +2,8 @@ import { execa } from "execa";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 
+import { timed } from "../core/timings.js";
+
 export type VerifyResult = {
   ok: boolean;
   /** True when the check could not run at all (no dependencies installed yet). */
@@ -32,13 +34,16 @@ export async function typecheck(root: string): Promise<VerifyResult> {
     };
   }
 
-  const result = await execa("tsc", ["--noEmit", "--pretty", "false"], {
-    cwd: root,
-    preferLocal: true,
-    localDir: root,
-    reject: false,
-    timeout: 300_000,
-  });
+  // Timed around the compiler alone, so a skipped check records no step.
+  const result = await timed("typecheck", () =>
+    execa("tsc", ["--noEmit", "--pretty", "false"], {
+      cwd: root,
+      preferLocal: true,
+      localDir: root,
+      reject: false,
+      timeout: 300_000,
+    }),
+  );
 
   const output = `${result.stdout}\n${result.stderr}`.trim();
 

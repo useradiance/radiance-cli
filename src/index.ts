@@ -19,6 +19,7 @@ import { deployCommand } from "./commands/deploy.js";
 import { destroyCommand } from "./commands/destroy.js";
 import { doctorCommand } from "./commands/doctor.js";
 import { initCommand } from "./commands/init.js";
+import { translateCommand } from "./commands/translate.js";
 import { previewCommand } from "./commands/preview.js";
 import { explainCommand, promptCommand } from "./commands/prompt.js";
 import { refreshCommand } from "./commands/refresh.js";
@@ -38,6 +39,7 @@ import {
   ui,
 } from "./core/logger.js";
 import { findProjectRoot } from "./core/project.js";
+import { setTimingsCommand } from "./core/timings.js";
 import { printHint } from "./harness/diagnostics.js";
 
 function version(): string {
@@ -85,6 +87,9 @@ program.hook("preAction", (_thisCommand, actionCommand) => {
   setVerbose(verbose);
 
   const name = commandPath(actionCommand);
+  // Before the multi-step check: `RADIANCE_TIMINGS_FILE` names the command
+  // for every command, including those that keep no step log (`translate`).
+  setTimingsCommand(name);
   if (!MULTI_STEP_COMMANDS.has(name)) return;
 
   startLogSession({
@@ -143,10 +148,47 @@ program
   )
   .option("--demo", "install demo-data and set EXPO_PUBLIC_SEED_DEMO=true")
   .option(
+    "--display-name <name>",
+    "name the app shows, when it should differ from its directory",
+  )
+  .option(
+    "--translate-locales",
+    "machine-translate the non-English locales after install (needs an LLM)",
+  )
+  .option(
+    "--no-i18n-sweep",
+    "skip sweeping hard-coded copy into locales/en.json (run `radiance translate` later)",
+  )
+  .option(
+    "--translation-memory <dir>",
+    "reuse and extend the translations stored in this directory (with --translate-locales)",
+  )
+  .option(
+    "--plan-json <path>",
+    "write the resolved plan (chosen starter, remaining work) as JSON",
+  )
+  .option(
     "--verbose",
     "echo step-by-step progress to the terminal (a log file is always written)",
   )
   .action(initCommand);
+
+program
+  .command("translate")
+  .description(
+    "sweep hard-coded copy into locales/en.json, then translate every other locale",
+  )
+  .option("--provider <id>", "ollama, openai, anthropic or cursor")
+  .option("--model <id>", "model to use")
+  .option(
+    "--since <git-ref>",
+    "sweep only the UI files changed since this git ref (skip the sweep if none)",
+  )
+  .option(
+    "--translation-memory <dir>",
+    "reuse and extend the translations stored in this directory",
+  )
+  .action(translateCommand);
 
 program
   .command("add")
@@ -162,6 +204,19 @@ program
     [],
   )
   .option("--pack <id>", "alias for --option pack=<id> (theme)")
+  .option(
+    "--translate-locales",
+    "sweep and translate the project's non-English locales afterwards (needs an LLM)",
+  )
+  .option(
+    "--provider <id>",
+    "ollama, openai, anthropic or cursor (with --translate-locales)",
+  )
+  .option("--model <id>", "model to use (with --translate-locales)")
+  .option(
+    "--translation-memory <dir>",
+    "reuse and extend the translations stored in this directory (with --translate-locales)",
+  )
   .option(
     "--verbose",
     "echo step-by-step progress to the terminal (a log file is always written)",
@@ -197,6 +252,10 @@ program
     "high",
   )
   .option("--no-verify", "skip the typecheck and repair loop")
+  .option(
+    "--max-repairs <n>",
+    "repair rounds after a failing typecheck (0-5; default from config)",
+  )
   .option("--follow-up", "with -y, auto-run the residual follow-up prompt once")
   .option("--provider <id>", "ollama, openai, anthropic or cursor")
   .option("--model <id>", "model to use for this run")
@@ -385,6 +444,10 @@ setup
   .description("login, link a Firebase project, and write `.env`")
   .option("--plan <free|paid>", "free or paid — skips the plan prompt")
   .option("--project <id>", "Firebase project id (headless / hosted)")
+  .option(
+    "--app-name <name>",
+    "display name for a created project (defaults to the project's own name)",
+  )
   .option(
     "--create-project",
     "create --project if missing (requires --project and -y)",

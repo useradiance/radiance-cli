@@ -17,6 +17,14 @@ import {
   resolveApiKey,
   type CloudProviderId,
 } from "../core/secrets.js";
+import {
+  collectUsage,
+  currentTimingStep,
+  recordLlmCall,
+  reportUsage,
+  timingsEnabled,
+  type LlmUsage,
+} from "../core/timings.js";
 
 export type ChatMessage = {
   role: "system" | "user" | "assistant";
@@ -154,6 +162,11 @@ function anthropicClient(model: string): LlmClient {
         messages: primed,
       });
 
+      reportUsage({
+        inputTokens: response.usage.input_tokens,
+        outputTokens: response.usage.output_tokens,
+      });
+
       const text = response.content
         .filter((block): block is Anthropic.TextBlock => block.type === "text")
         .map((block) => block.text)
@@ -180,6 +193,11 @@ function openAiClient(model: string): LlmClient {
         ...(options.json
           ? { response_format: { type: "json_object" as const } }
           : {}),
+      });
+
+      reportUsage({
+        inputTokens: response.usage?.prompt_tokens,
+        outputTokens: response.usage?.completion_tokens,
       });
 
       return response.choices[0]?.message?.content ?? "";
@@ -361,6 +379,14 @@ export function createClient(
   config: GlobalConfig,
   overrides: Partial<GlobalConfig> = {},
 ): LlmClient {
+  const client = providerClient(config, overrides);
+  return timingsEnabled() ? withLlmTimings(client) : client;
+}
+
+function providerClient(
+  config: GlobalConfig,
+  overrides: Partial<GlobalConfig>,
+): LlmClient {
   const merged = { ...config, ...overrides };
   const model = resolveModel(merged);
 
@@ -374,6 +400,57 @@ export function createClient(
     case "cursor":
       return cursorClient(model);
   }
+}
+
+/**
+ * Records each `complete()` for `RADIANCE_TIMINGS_FILE`: which step made it,
+ * how long it took, how big the prompt and reply were, and — where the
+ * provider says — how many tokens went each way.
+ *
+ * Wrapped here rather than in each command so that no call can be missed;
+ * `createClient` is the only way the CLI gets a client. Sizes are character
+ * counts, never the text itself. Exported for tests.
+ */
+export function withLlmTimings(client: LlmClient): LlmClient {
+  return {
+    provider: client.provider,
+    model: client.model,
+    async complete(messages, options = {}) {
+      const step = currentTimingStep();
+      const promptChars = messages.reduce(
+        (sum, message) => sum + message.content.length,
+        0,
+      );
+      const usage: LlmUsage = {};
+      const started = performance.now();
+      let reply: string | null = null;
+
+      try {
+        reply = await collectUsage(usage, () =>
+          client.complete(messages, options),
+        );
+        return reply;
+      } finally {
+        recordLlmCall({
+          step,
+          provider: client.provider,
+          model: client.model,
+          ms: Math.round(performance.now() - started),
+          promptChars,
+          replyChars: reply?.length ?? 0,
+          maxTokens: options.maxTokens ?? null,
+          json: Boolean(options.json),
+          ok: reply !== null,
+          ...(usage.inputTokens === undefined
+            ? {}
+            : { inputTokens: usage.inputTokens }),
+          ...(usage.outputTokens === undefined
+            ? {}
+            : { outputTokens: usage.outputTokens }),
+        });
+      }
+    },
+  };
 }
 
 /** Pulls the first JSON object out of a reply, tolerating prose or code fences around it. */
