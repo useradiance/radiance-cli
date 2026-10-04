@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build + typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      - run: yarn typecheck
+      - run: yarn build
+      # `files: ["dist"]` means a broken build publishes an empty package, and
+      # the failure only shows up when a user installs it.
+      - name: Package contains a runnable binary
+        run: |
+          test -f dist/index.js
+          node dist/index.js --version
+
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    # The merge-combination suite scaffolds projects and runs a real install
+    # and tsc for each, so it is minutes, not seconds.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: yarn
+
+      # The catalogue this CLI is tested against. Pinned to the tag the CLI
+      # would resolve by default, so CI exercises the pairing a user gets.
+      - name: Check out the template catalogue
+        uses: actions/checkout@v4
+        with:
+          repository: useradiance/radiance-templates
+          path: .catalogue
+
+      - run: yarn install --frozen-lockfile
+      - run: yarn build
+      - name: Test
+        env:
+          RADIANCE_TEMPLATES_PATH: ${{ github.workspace }}/.catalogue
+        run: yarn test
+
+  format:
+    name: format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: yarn
+      - run: yarn install --frozen-lockfile
+      - run: npx prettier --check "src/**/*.ts"

@@ -1,11 +1,35 @@
-# radiance-cli
+<p align="center">
+  <img src=".github/radiance-mark.svg" width="72" height="72" alt="">
+</p>
+
+<h1 align="center">radiance-cli</h1>
+
+<p align="center">
+  <b>One prompt. iOS, Android, web and a backend.</b><br>
+  Radiance scaffolds a real Expo app and wires up Firebase auth, database, storage and
+  functions — a shippable product on three platforms, not a web page that looks like one.
+</p>
+
+<p align="center">
+  <a href="https://radianc.es">radianc.es</a> ·
+  <a href="https://www.npmjs.com/package/radiance-cli">npm</a> ·
+  <a href="https://github.com/useradiance/radiance-templates">template catalogue</a>
+</p>
+
+---
+
+This is the whole harness. The hosted product at [radianc.es](https://radianc.es) runs this
+exact binary — it exists because most people would rather not run it themselves. Nothing here
+needs an account, a server, or our infrastructure.
+
+```bash
+npm i -g radiance-cli
+```
 
 Build Expo + Firebase apps from the [Radiance template catalogue](https://github.com/useradiance/radiance-templates),
 with an AI harness that reuses the catalogue before it writes any code.
 
 ```bash
-npm i -g radiance-cli
-
 radiance init my-app --template social-app --pm pnpm   # offers Firebase setup
 # or describe the app and let Radiance interview for the rest:
 radiance init shop --prompt "an online store with Stripe and Google sign-in"
