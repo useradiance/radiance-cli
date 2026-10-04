@@ -13,8 +13,9 @@ import {
   type ProjectConfig,
 } from "../src/core/project.js";
 import { readRegistry, type TemplateSource } from "../src/core/registry.js";
+import { resolveTemplatesRoot } from "./templates-root.js";
 
-const TEMPLATES_ROOT = join(process.cwd(), "..", "radiance-templates");
+const TEMPLATES_ROOT = resolveTemplatesRoot();
 const TYPECHECK_TIMEOUT_MS = 10 * 60_000;
 
 async function localSource(): Promise<TemplateSource> {

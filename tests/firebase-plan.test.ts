@@ -17,12 +17,11 @@ import {
   isRetryableFirebaseDeployFailure,
 } from "../src/core/firebase-provision.js";
 import { RadianceError } from "../src/core/logger.js";
+import { resolveTemplatesRoot } from "./templates-root.js";
 
 const emulatorProductsUrl = pathToFileURL(
   join(
-    process.cwd(),
-    "..",
-    "radiance-templates",
+    resolveTemplatesRoot(),
     "scaffold",
     "expo-app",
     "scripts",
