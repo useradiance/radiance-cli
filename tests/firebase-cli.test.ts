@@ -5,6 +5,7 @@ import { applySdkConfigToEnv } from "../src/commands/setup-firebase.js";
 import {
   ensureGoogleApiEnabled,
   extractJsonObject,
+  gcpDisplayName,
   isApiNotEnabledError,
   isValidProjectId,
   suggestProjectId,
@@ -198,5 +199,37 @@ describe("auth provider mapping", () => {
     assert.deepEqual(unsupportedAuthProviders(["password", "apple.com"]), [
       "apple.com",
     ]);
+  });
+});
+
+describe("gcpDisplayName", () => {
+  it("passes a name Google already accepts", () => {
+    for (const name of ["radiance-app", "social-test", "My App 2", "Ada's App"]) {
+      assert.equal(gcpDisplayName(name), name);
+    }
+  });
+
+  // The hosted platform names scaffolds after an internal app id, so this is
+  // the shape that actually reached Cloud Resource Manager and failed the
+  // whole run on a cosmetic field.
+  it("replaces characters Google rejects, such as the underscore in an app id", () => {
+    assert.equal(gcpDisplayName("app_1a2b3c4d5e"), "app-1a2b3c4d5e");
+  });
+
+  it("must start with a letter", () => {
+    assert.equal(gcpDisplayName("2048-game"), "game");
+    assert.equal(gcpDisplayName("-leading"), "leading");
+  });
+
+  it("clamps to the 30-character maximum", () => {
+    assert.equal(gcpDisplayName("a".repeat(40)).length, 30);
+  });
+
+  it("falls back when nothing usable survives", () => {
+    // Under four characters is rejected by Google, so a fallback beats
+    // failing on a label.
+    for (const name of ["", "!!!", "ab", "123"]) {
+      assert.equal(gcpDisplayName(name), "radiance-app");
+    }
   });
 });

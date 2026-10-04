@@ -237,7 +237,12 @@ export async function setupFirebase(
     );
   }
 
-  await runCloudProvision(root, projectId, { appName, email, plan });
+  await runCloudProvision(root, projectId, {
+    appName,
+    email,
+    plan,
+    headless: options.yes === true,
+  });
   await syncGoogleOAuthClientToEnv(root, projectId);
 
   ui.blank();
@@ -343,7 +348,13 @@ async function resolvePlanForReuse(
 async function runCloudProvision(
   root: string,
   projectId: string,
-  meta: { appName: string; email: string; plan: ProjectPlan },
+  meta: {
+    appName: string;
+    email: string;
+    plan: ProjectPlan;
+    /** No one is watching: a warning here would be a silent failure. */
+    headless?: boolean;
+  },
 ): Promise<void> {
   ui.blank();
   ui.step(
@@ -388,6 +399,12 @@ async function runCloudProvision(
     ui.detail(
       "Retry with `radiance setup firebase` (keep the project) or `radiance deploy --rules`.",
     );
+    // A warning is the right call when someone is watching: the project is
+    // linked and they can retry the rest. Nobody is watching a headless run,
+    // and there the same warning becomes a silent lie — the caller sees exit
+    // code 0 and reports a backend that has no Firestore, no Auth and no
+    // rules behind it.
+    if (meta.headless) throw error;
   }
 }
 
@@ -470,6 +487,7 @@ export async function setupFirebaseCommand(
   options: {
     plan?: string;
     project?: string;
+    appName?: string;
     createProject?: boolean;
     yes?: boolean;
   } = {},
@@ -482,7 +500,10 @@ export async function setupFirebaseCommand(
   const plan = parsePlanFlag(options.plan);
   await setupFirebase(root, {
     force: true,
-    appName: config.name,
+    // The hosted platform passes this. Its scaffold directories are named
+    // after an internal app id, which becomes `radiance.json`'s name — neither
+    // meaningful to the user nor valid as a GCP display name.
+    appName: options.appName?.trim() || config.name,
     plan,
     projectId: options.project,
     createProject: options.createProject === true,

@@ -214,6 +214,32 @@ export async function listFirebaseProjects(): Promise<FirebaseProject[]> {
   return (projects ?? []).filter((project) => project.state !== "DELETED");
 }
 
+/**
+ * A project display name Google will accept.
+ *
+ * Cloud Resource Manager allows letters, numbers, hyphens, quotes, spaces and
+ * exclamation points, 4-30 characters. The name we pass is whatever the
+ * project is called locally — which for a directory named `app_1a2b3c` (the
+ * hosted platform names scaffolds after an internal id) contains an
+ * underscore, and the whole `setup firebase` run fails on a cosmetic field
+ * with "project display name contains invalid characters".
+ *
+ * Sanitising beats failing: the display name is a label, not an identifier,
+ * and no user can act on that error.
+ */
+export function gcpDisplayName(
+  input: string,
+  fallback = "radiance-app",
+): string {
+  const cleaned = input
+    .replace(/[^A-Za-z0-9'" !-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[^A-Za-z]+/, "")
+    .trim()
+    .slice(0, 30);
+  return cleaned.length >= 4 ? cleaned : fallback;
+}
+
 export async function createFirebaseProject(
   projectId: string,
   displayName: string,
@@ -233,10 +259,30 @@ export async function createFirebaseProject(
           Authorization: `Bearer ${accessToken}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ projectId, name: displayName }),
+        body: JSON.stringify({ projectId, name: gcpDisplayName(displayName) }),
       },
     );
-    if (!createRes.ok) {
+    // 409 is the normal shape of a retry: an earlier attempt created the
+    // project and then failed later on. Treating it as fatal makes
+    // `--create-project` usable exactly once, which is no use to any caller
+    // that retries — and the hosted platform retries three times.
+    //
+    // Project ids are globally unique, though, so 409 can also mean the id
+    // belongs to a stranger. Read it back before assuming it is ours:
+    // continuing blindly would fail later with a permission error that says
+    // nothing about the real cause.
+    if (createRes.status === 409) {
+      const owned = await fetch(
+        `https://cloudresourcemanager.googleapis.com/v1/projects/${encodeURIComponent(projectId)}`,
+        { headers: { Authorization: `Bearer ${accessToken}` } },
+      );
+      if (!owned.ok) {
+        throw new RadianceError(
+          `Project id ${projectId} is already taken`,
+          "Google project ids are globally unique. Choose a different one.",
+        );
+      }
+    } else if (!createRes.ok) {
       throw new RadianceError(
         `Could not create GCP project ${projectId}`,
         await createRes.text(),
@@ -254,6 +300,12 @@ export async function createFirebaseProject(
       }
       await delay(5_000);
     }
+
+    // A project created seconds ago has none of the Firebase APIs switched on,
+    // and `:addFirebase` answers 403 "The caller does not have permission"
+    // rather than anything about an API — which reads as a credentials problem
+    // and is not one. Enable it first.
+    await ensureGoogleApiEnabled(projectId, "firebase.googleapis.com");
 
     const addFirebase = await fetch(
       `https://firebase.googleapis.com/v1beta1/projects/${encodeURIComponent(projectId)}:addFirebase`,
@@ -280,7 +332,7 @@ export async function createFirebaseProject(
     "projects:create",
     projectId,
     "--display-name",
-    displayName,
+    gcpDisplayName(displayName),
   ]);
 }
 
@@ -705,10 +757,17 @@ export async function ensureGoogleApiEnabled(
   const maxPolls = options.maxPolls ?? API_ENABLE_MAX_POLLS;
 
   const accessToken = await getAccessToken();
+  // Deliberately no `x-goog-user-project`. That header names the project the
+  // call is billed to, and naming the project being modified is fatal on a
+  // brand-new one: Service Usage is not enabled there yet, so the request to
+  // enable things is itself refused with "Service Usage API has not been used
+  // in project X before or it is disabled" — about the project we are in the
+  // middle of setting up. Measured on a fresh project: with the header, 403;
+  // without it, 200. The project is already named in the URL path, and
+  // authority comes from the caller's role on it.
   const headers = {
     Authorization: `Bearer ${accessToken}`,
     Accept: "application/json",
-    "x-goog-user-project": projectId,
   };
 
   const checkEnabled = async (): Promise<boolean> => {
