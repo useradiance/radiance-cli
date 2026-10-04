@@ -1,7 +1,8 @@
 name: release
 
-# Publishing is driven by a tag, so the released artifact is always traceable
-# to a commit. Never publish from a branch.
+# Staging is driven by a tag, so the artifact is always traceable to a commit.
+# Never stage from a branch. A maintainer then approves with 2FA
+# (`npm stage approve <id>`); CI cannot publish directly to the registry.
 on:
   push:
     tags: ["v*"]
@@ -11,15 +12,20 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Lets npm record where the package was built from.
+      # OIDC for npm trusted publishing (and provenance). No long-lived
+      # publish token — configure the trusted publisher on npmjs.com instead.
       id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          # npm stage / trusted publishing need Node >= 22.14 and npm >= 11.15.
+          node-version: "22.14"
           cache: yarn
           registry-url: https://registry.npmjs.org
+
+      - name: npm CLI for staged publishing
+        run: npm install -g npm@^11.15.0
 
       - run: yarn install --frozen-lockfile
       - run: yarn build
@@ -33,9 +39,19 @@ jobs:
             exit 1
           fi
 
-      - name: Binary runs before it is published
+      - name: Binary runs before it is staged
         run: node dist/index.js --version
 
-      - run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Stages only. A package maintainer must run `npm stage approve <id>`
+      # (with 2FA) before the version is public. Trusted publishing on
+      # npmjs.com must allow `npm stage publish` for workflow `release.yml`
+      # in `useradiance/radiance-cli` — do not also allow direct `npm publish`.
+      - name: Stage package on npm
+        run: npm stage publish --access public
+
+      - name: How to finish the release
+        run: |
+          echo "CI only staged the package. To publish it:"
+          echo "  npm stage list radiance-cli"
+          echo "  npm stage approve <stage-id>   # prompts for 2FA"
+          echo "  npm view radiance-cli version"
